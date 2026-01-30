@@ -139,6 +139,39 @@ app.post('/deposit', async (req, res) => {
         const userCheck = await db.query("SELECT * FROM users WHERE phone = $1", [phone]);
         if (userCheck.rows.length === 0) return res.status(400).json({ error: "User not found" });
 
+        // WITHDRAW ROUTE
+app.post('/withdraw', async (req, res) => {
+  const { username, amount } = req.body;
+  const withdrawAmount = parseFloat(amount);
+
+  try {
+    // 1. Find the user
+    const user = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+    
+    if (user.rows.length === 0) {
+      return res.json({ success: false, message: "User not found" });
+    }
+
+    const currentBalance = parseFloat(user.rows[0].balance);
+
+    // 2. Check if they have enough money
+    if (currentBalance < withdrawAmount) {
+      return res.json({ success: false, message: "Insufficient funds!" });
+    }
+
+    // 3. Subtract the money
+    const newBalance = currentBalance - withdrawAmount;
+    await pool.query('UPDATE users SET balance = $1 WHERE username = $2', [newBalance, username]);
+
+    // 4. Send back success
+    res.json({ success: true, newBalance: newBalance, message: "Withdrawal successful! Check your Mobile Money." });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
         // Update Balance
         const updateResult = await db.query(
             "UPDATE users SET deposit_balance = deposit_balance + $1 WHERE phone = $2 RETURNING deposit_balance, winning_balance",
