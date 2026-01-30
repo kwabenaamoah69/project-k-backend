@@ -1,152 +1,104 @@
 const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
 const cors = require('cors');
-const http = require('http'); 
-const { Server } = require('socket.io'); 
-const db = require('./db'); 
-const matchmaker = require('./matchmaker'); 
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken'); 
-
+const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
-const server = http.createServer(app); 
-const JWT_SECRET = "my_secret_key_123"; 
+const server = http.createServer(app);
 
+// 1. DATABASE CONNECTION
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// 2. MIDDLEWARE
 app.use(cors());
-app.use(express.json()); 
+app.use(express.json());
 
-const activeGames = {}; 
-// --- AUTO-CREATE DATABASE TABLE ---
-(async () => {
-  try {
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        username VARCHAR(50),
-        phone VARCHAR(20) UNIQUE,
-        password_hash TEXT,
-        friend_code VARCHAR(20),
-        deposit_balance DECIMAL(10,2) DEFAULT 0,
-        winning_balance DECIMAL(10,2) DEFAULT 0
-      );
-    `);
-    console.log("✅ Database Tables Verified");
-  } catch (err) {
-    console.error("❌ DB Init Failed:", err);
-  }
-})();
+// 3. AUTHENTICATION ROUTES
 
-// --- 1. REGISTER ---
+// --- REGISTER ---
 app.post('/register', async (req, res) => {
-    try {
-        const { username, phone, password } = req.body;
-        const userCheck = await db.query("SELECT * FROM users WHERE phone = $1", [phone]);
-        if (userCheck.rows.length > 0) return res.status(400).json({ error: "User already exists!" });
-
-        const salt = await bcrypt.genSalt(10);
-        const hashedPassword = await bcrypt.hash(password, salt);
-        const friendCode = username.substring(0, 4).toUpperCase() + Math.floor(1000 + Math.random() * 9000);
-
-        // FIX: Added 'phone' to the RETURNING list
-        const newUser = await db.query(
-            "INSERT INTO users (username, phone, password_hash, friend_code) VALUES ($1, $2, $3, $4) RETURNING id, username, phone, friend_code",
-            [username, phone, hashedPassword, friendCode]
-        );
-        
-        const token = jwt.sign({ id: newUser.rows[0].id }, JWT_SECRET);
-        
-        // FIX: Ensure the user object has the phone number
-        const userToSend = {
-            ...newUser.rows[0],
-            balance: 0
-        };
-
-        res.json({ message: "Welcome!", user: userToSend, token: token });
-
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: "Server Error" });
-    }
+  const { username, phone, password } = req.body;
+  try {
+    const hashedPassword = await bcrypt.hash(password, 10);
+    // Create user with 0 balance
+    const newUser = await pool.query(
+      'INSERT INTO users (username, phone, password, balance) VALUES ($1, $2, $3, 0) RETURNING *',
+      [username, phone, hashedPassword]
+    );
+    res.json(newUser.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "User already exists or Server Error" });
+  }
 });
 
-// --- 2. LOGIN ---
+// --- LOGIN ---
 app.post('/login', async (req, res) => {
-    try {
-        const { phone, password } = req.body;
-        
-        const userResult = await db.query("SELECT * FROM users WHERE phone = $1", [phone]);
-        if (userResult.rows.length === 0) return res.status(400).json({ error: "User not found" });
+  const { phone, password } = req.body;
+  try {
+    // Find user by Phone
+    const user = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
+    
+    if (user.rows.length === 0) return res.status(400).json({ error: "User not found" });
 
-        const user = userResult.rows[0];
+    // Check Password
+    const validPass = await bcrypt.compare(password, user.rows[0].password);
+    if (!validPass) return res.status(400).json({ error: "Wrong password" });
 
-        const validPass = await bcrypt.compare(password, user.password_hash);
-        if (!validPass) return res.status(400).json({ error: "Invalid Password" });
+    // Create Token
+    const token = jwt.sign({ id: user.rows[0].id }, 'SECRET_KEY');
+    res.json({ token, user: user.rows[0] });
 
-        const token = jwt.sign({ id: user.id }, JWT_SECRET);
-
-        // FIX: Added 'phone' here too so the frontend knows it
-        res.json({ 
-            message: "Login Successful", 
-            token: token,
-            user: { 
-                id: user.id, 
-                username: user.username, 
-                phone: user.phone, // <--- CRITICAL FIX
-                balance: parseFloat(user.deposit_balance) + parseFloat(user.winning_balance) 
-            }
-        });
-
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: "Server Error" });
-    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server Error during Login" });
+  }
 });
 
-// --- 3. ME (Check Balance) ---
+// --- GET USER INFO ---
 app.get('/me', async (req, res) => {
-    try {
-        const token = req.headers.authorization;
-        if (!token) return res.status(401).json({ error: "No token provided" });
+  const token = req.headers['authorization'];
+  if(!token) return res.status(401).json({error: "No token"});
 
-        const decoded = jwt.verify(token, JWT_SECRET);
-        const userResult = await db.query("SELECT id, username, phone, friend_code, deposit_balance, winning_balance FROM users WHERE id = $1", [decoded.id]);
-        
-        if (userResult.rows.length === 0) return res.status(404).json({ error: "User not found" });
-
-        const user = userResult.rows[0];
-        // Combine balances for display
-        const userData = {
-            ...user,
-            balance: parseFloat(user.deposit_balance) + parseFloat(user.winning_balance)
-        };
-        
-        res.json(userData);
-
-    } catch (err) {
-        res.status(401).json({ error: "Invalid Token" });
-    }
+  try {
+    const decoded = jwt.verify(token, 'SECRET_KEY');
+    const user = await pool.query('SELECT * FROM users WHERE id = $1', [decoded.id]);
+    res.json(user.rows[0]);
+  } catch (err) {
+    res.status(401).json({ error: "Invalid Token" });
+  }
 });
 
-// --- 4. DEPOSIT ---
+// --- DEPOSIT ---
 app.post('/deposit', async (req, res) => {
-    try {
-        const { phone, amount } = req.body;
-        
-        console.log("Processing deposit for:", phone); // Debug Log
+  const { phone, amount } = req.body;
+  try {
+    const user = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
+    const newBalance = parseFloat(user.rows[0].balance) + parseFloat(amount);
+    
+    await pool.query('UPDATE users SET balance = $1 WHERE phone = $2', [newBalance, phone]);
+    res.json({ newBalance });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Deposit Failed" });
+  }
+});
 
-        // Check if user exists
-        const userCheck = await db.query("SELECT * FROM users WHERE phone = $1", [phone]);
-        if (userCheck.rows.length === 0) return res.status(400).json({ error: "User not found" });
-
-        // WITHDRAW ROUTE
+// --- NEW: WITHDRAW ---
 app.post('/withdraw', async (req, res) => {
-  const { username, amount } = req.body;
+  console.log("Withdraw Request:", req.body);
+  const { phone, amount } = req.body;
   const withdrawAmount = parseFloat(amount);
 
   try {
-    // 1. Find the user
-    const user = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+    const user = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
     
     if (user.rows.length === 0) {
       return res.json({ success: false, message: "User not found" });
@@ -154,125 +106,62 @@ app.post('/withdraw', async (req, res) => {
 
     const currentBalance = parseFloat(user.rows[0].balance);
 
-    // 2. Check if they have enough money
     if (currentBalance < withdrawAmount) {
-      return res.json({ success: false, message: "Insufficient funds!" });
+      return res.json({ success: false, message: "Insufficient Funds" });
     }
 
-    // 3. Subtract the money
     const newBalance = currentBalance - withdrawAmount;
-    await pool.query('UPDATE users SET balance = $1 WHERE username = $2', [newBalance, username]);
-
-    // 4. Send back success
-    res.json({ success: true, newBalance: newBalance, message: "Withdrawal successful! Check your Mobile Money." });
+    await pool.query('UPDATE users SET balance = $1 WHERE phone = $2', [newBalance, phone]);
+    
+    res.json({ success: true, newBalance, message: "Cash out successful!" });
 
   } catch (err) {
     console.error(err);
-    res.status(500).json({ success: false, message: "Server error" });
+    res.status(500).json({ success: false, message: "Server Error" });
   }
 });
 
-        // Update Balance
-        const updateResult = await db.query(
-            "UPDATE users SET deposit_balance = deposit_balance + $1 WHERE phone = $2 RETURNING deposit_balance, winning_balance",
-            [amount, phone]
-        );
-
-        const updatedUser = updateResult.rows[0];
-        const totalBalance = parseFloat(updatedUser.deposit_balance) + parseFloat(updatedUser.winning_balance);
-
-        res.json({ message: "Deposit Successful", newBalance: totalBalance });
-
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: "Deposit Failed" });
-    }
-});
-
-// --- SOCKET.IO REAL-TIME ENGINE ---
+// 4. WEBSOCKET GAME LOGIC
 const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] }
+  cors: { origin: "*" }
 });
+
+let waitingPlayer = null;
 
 io.on('connection', (socket) => {
-    console.log(`User Connected: ${socket.id}`);
+  console.log('User Connected:', socket.id);
 
-    // MATCHMAKING
-    socket.on('FIND_MATCH', async (data) => {
-        const { gameType, stake, userId } = data;
-        socket.userId = userId;
+  socket.on('FIND_MATCH', (data) => {
+    if (waitingPlayer) {
+      // Start Game
+      const matchId = 'match_' + Date.now();
+      const p1 = waitingPlayer;
+      const p2 = socket;
 
-        const result = matchmaker.addPlayer(socket, gameType, stake);
+      p1.join(matchId);
+      p2.join(matchId);
 
-        if (result.status === 'MATCH_FOUND') {
-            const { matchId, player1, player2 } = result;
-            player1.join(matchId);
-            player2.join(matchId);
-            
-            console.log(`✅ MATCH START: User ${player1.userId} vs User ${player2.userId}`);
+      io.to(matchId).emit('GAME_START', { matchId, p1: p1.id, p2: p2.id });
+      waitingPlayer = null;
+    } else {
+      waitingPlayer = socket;
+      socket.emit('WAITING');
+    }
+  });
 
-            // Deduct Money
-            try {
-                await db.query("UPDATE users SET deposit_balance = deposit_balance - $1 WHERE id = $2", [stake, player1.userId]);
-                await db.query("UPDATE users SET deposit_balance = deposit_balance - $1 WHERE id = $2", [stake, player2.userId]);
-            } catch (err) { console.error(err); }
+  socket.on('ROLL_DICE', ({ matchId }) => {
+    const roll = Math.floor(Math.random() * 6) + 1;
+    io.to(matchId).emit('ROLL_RESULT', { playerId: socket.id, roll });
+    
+    // Simple win logic (In real game, we wait for both)
+    // For now, let's just broadcast the roll.
+  });
 
-            io.to(matchId).emit('GAME_START', { matchId, gameType, stake });
-        } else {
-            socket.emit('WAITING', { message: "Searching for opponent..." });
-        }
-    });
-
-    // GAME LOGIC
-    socket.on('ROLL_DICE', async (data) => {
-        const { matchId } = data;
-        const roll = Math.floor(Math.random() * 6) + 1; 
-
-        if (!activeGames[matchId]) activeGames[matchId] = { player1: null, player2: null };
-        
-        if (!activeGames[matchId].player1 && socket.id !== activeGames[matchId].player2?.id) {
-            activeGames[matchId].player1 = { id: socket.id, userId: socket.userId, roll: roll };
-        } else if (!activeGames[matchId].player2 && socket.id !== activeGames[matchId].player1?.id) {
-            activeGames[matchId].player2 = { id: socket.id, userId: socket.userId, roll: roll };
-        }
-
-        io.to(matchId).emit('ROLL_RESULT', { playerId: socket.id, roll: roll });
-
-        const game = activeGames[matchId];
-        if (game.player1 && game.player2) {
-            let winnerId = null;
-            let winnerUserId = null;
-            let message = "It's a Draw!";
-
-            if (game.player1.roll > game.player2.roll) {
-                winnerId = game.player1.id; winnerUserId = game.player1.userId; message = "Player 1 Wins!";
-            } else if (game.player2.roll > game.player1.roll) {
-                winnerId = game.player2.id; winnerUserId = game.player2.userId; message = "Player 2 Wins!";
-            }
-
-            if (winnerUserId) {
-                const winnings = 18; 
-                try {
-                    await db.query("UPDATE users SET winning_balance = winning_balance + $1 WHERE id = $2", [winnings, winnerUserId]);
-                } catch (err) { console.error(err); }
-            }
-
-            io.to(matchId).emit('GAME_OVER', {
-                winnerId: winnerId,
-                message: message,
-                p1_roll: game.player1.roll,
-                p2_roll: game.player2.roll
-            });
-            delete activeGames[matchId];
-        }
-    });
-
-    socket.on('disconnect', () => {
-        matchmaker.removePlayer(socket.id);
-    });
+  socket.on('disconnect', () => {
+    if (waitingPlayer === socket) waitingPlayer = null;
+  });
 });
 
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
-    console.log(`SERVER RUNNING on Port ${PORT}`);
-});
+// 5. START SERVER
+const PORT = process.env.PORT || 10000;
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
