@@ -17,6 +17,25 @@ app.use(cors());
 app.use(express.json()); 
 
 const activeGames = {}; 
+// --- AUTO-CREATE DATABASE TABLE ---
+(async () => {
+  try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(50),
+        phone VARCHAR(20) UNIQUE,
+        password_hash TEXT,
+        friend_code VARCHAR(20),
+        deposit_balance DECIMAL(10,2) DEFAULT 0,
+        winning_balance DECIMAL(10,2) DEFAULT 0
+      );
+    `);
+    console.log("✅ Database Tables Verified");
+  } catch (err) {
+    console.error("❌ DB Init Failed:", err);
+  }
+})();
 
 // --- 1. REGISTER ---
 app.post('/register', async (req, res) => {
