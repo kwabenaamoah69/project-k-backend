@@ -22,6 +22,24 @@ app.use(express.json());
 
 // 3. ROUTES
 app.get('/', (req, res) => res.send('Server is Running!'));
+// --- DANGER: RESET DATABASE (Fixes missing columns) ---
+app.get('/reset-db', async (req, res) => {
+  try {
+    await pool.query('DROP TABLE IF EXISTS users'); // Deletes the old broken table
+    await pool.query(`
+      CREATE TABLE users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(50),
+        phone VARCHAR(20) UNIQUE,
+        password VARCHAR(200),
+        balance NUMERIC DEFAULT 0
+      );
+    `);
+    res.send("Database has been RESET. You can now Register!");
+  } catch (err) {
+    res.send("Reset Error: " + err.message);
+  }
+});
 
 // --- REGISTER ---
 app.post('/register', async (req, res) => {
