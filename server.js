@@ -2,7 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const { Pool } = require('pg'); // This is the missing piece!
+const { Pool } = require('pg'); // CRITICAL LINE
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
@@ -10,7 +10,7 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 
-// 1. DATABASE CONNECTION (Defining 'pool' here so the whole app can see it)
+// 1. DATABASE CONNECTION (Defined GLOBALLY here)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
@@ -21,6 +21,7 @@ app.use(cors());
 app.use(express.json());
 
 // 3. ROUTES
+app.get('/', (req, res) => res.send('Server is Running!'));
 
 // --- REGISTER ---
 app.post('/register', async (req, res) => {
@@ -33,8 +34,8 @@ app.post('/register', async (req, res) => {
     );
     res.json(newUser.rows[0]);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "User already exists or Server Error" });
+    console.error("Register Error:", err);
+    res.status(500).json({ error: "User already exists" });
   }
 });
 
@@ -51,8 +52,8 @@ app.post('/login', async (req, res) => {
     const token = jwt.sign({ id: user.rows[0].id }, 'SECRET_KEY');
     res.json({ token, user: user.rows[0] });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Server Error" });
+    console.error("Login Error:", err);
+    res.status(500).json({ error: "Login Error" });
   }
 });
 
@@ -78,37 +79,36 @@ app.post('/deposit', async (req, res) => {
     await pool.query('UPDATE users SET balance = $1 WHERE phone = $2', [newBalance, phone]);
     res.json({ newBalance });
   } catch (err) {
-    console.error(err);
+    console.error("Deposit Error:", err);
     res.status(500).json({ error: "Deposit Failed" });
   }
 });
 
-// --- WITHDRAW (The Fixed Version) ---
+// --- WITHDRAW (Fixed Logic) ---
 app.post('/withdraw', async (req, res) => {
   console.log("Withdraw Request:", req.body);
   const { phone, amount } = req.body;
   
-  // Safety Checks
+  // Validation
   if (!phone || !amount) return res.status(400).json({ success: false, message: "Missing data" });
-  
   const withdrawAmount = parseFloat(amount);
   if (isNaN(withdrawAmount) || withdrawAmount <= 0) {
     return res.status(400).json({ success: false, message: "Invalid amount" });
   }
 
   try {
-    // Check User
+    // 1. Get User
     const user = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
     if (user.rows.length === 0) return res.status(404).json({ success: false, message: "User not found" });
 
     const currentBalance = parseFloat(user.rows[0].balance);
 
-    // Check Balance
+    // 2. Check Balance
     if (currentBalance < withdrawAmount) {
       return res.status(400).json({ success: false, message: "Insufficient Funds" });
     }
 
-    // Subtract Money
+    // 3. Update Balance
     const newBalance = currentBalance - withdrawAmount;
     await pool.query('UPDATE users SET balance = $1 WHERE phone = $2', [newBalance, phone]);
     
@@ -121,14 +121,12 @@ app.post('/withdraw', async (req, res) => {
   }
 });
 
-// 4. WEBSOCKETS (The Game)
+// 4. GAME LOGIC (Socket.io)
 const io = new Server(server, { cors: { origin: "*" } });
 let waitingPlayer = null;
 
 io.on('connection', (socket) => {
-  console.log('User Connected:', socket.id);
-
-  socket.on('FIND_MATCH', (data) => {
+  socket.on('FIND_MATCH', () => {
     if (waitingPlayer) {
       const matchId = 'match_' + Date.now();
       io.to(waitingPlayer.id).emit('GAME_START', { matchId });
@@ -141,11 +139,12 @@ io.on('connection', (socket) => {
   });
 
   socket.on('ROLL_DICE', ({ matchId }) => {
+    // Simple random roll logic
     const roll = Math.floor(Math.random() * 6) + 1;
-    io.emit('ROLL_RESULT', { playerId: socket.id, roll }); // Broadcast to everyone for now
+    io.emit('ROLL_RESULT', { playerId: socket.id, roll }); 
   });
 });
 
-// 5. START SERVER
+// 5. START
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
