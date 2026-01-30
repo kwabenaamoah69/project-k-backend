@@ -2,7 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const { Pool } = require('pg');
+const { Pool } = require('pg'); // This is the missing piece!
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
@@ -10,7 +10,7 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 
-// 1. DATABASE CONNECTION
+// 1. DATABASE CONNECTION (Defining 'pool' here so the whole app can see it)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
@@ -20,14 +20,13 @@ const pool = new Pool({
 app.use(cors());
 app.use(express.json());
 
-// 3. AUTHENTICATION ROUTES
+// 3. ROUTES
 
 // --- REGISTER ---
 app.post('/register', async (req, res) => {
   const { username, phone, password } = req.body;
   try {
     const hashedPassword = await bcrypt.hash(password, 10);
-    // Create user with 0 balance
     const newUser = await pool.query(
       'INSERT INTO users (username, phone, password, balance) VALUES ($1, $2, $3, 0) RETURNING *',
       [username, phone, hashedPassword]
@@ -43,22 +42,17 @@ app.post('/register', async (req, res) => {
 app.post('/login', async (req, res) => {
   const { phone, password } = req.body;
   try {
-    // Find user by Phone
     const user = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
-    
     if (user.rows.length === 0) return res.status(400).json({ error: "User not found" });
 
-    // Check Password
     const validPass = await bcrypt.compare(password, user.rows[0].password);
     if (!validPass) return res.status(400).json({ error: "Wrong password" });
 
-    // Create Token
     const token = jwt.sign({ id: user.rows[0].id }, 'SECRET_KEY');
     res.json({ token, user: user.rows[0] });
-
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Server Error during Login" });
+    res.status(500).json({ error: "Server Error" });
   }
 });
 
@@ -66,7 +60,6 @@ app.post('/login', async (req, res) => {
 app.get('/me', async (req, res) => {
   const token = req.headers['authorization'];
   if(!token) return res.status(401).json({error: "No token"});
-
   try {
     const decoded = jwt.verify(token, 'SECRET_KEY');
     const user = await pool.query('SELECT * FROM users WHERE id = $1', [decoded.id]);
@@ -82,7 +75,6 @@ app.post('/deposit', async (req, res) => {
   try {
     const user = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
     const newBalance = parseFloat(user.rows[0].balance) + parseFloat(amount);
-    
     await pool.query('UPDATE users SET balance = $1 WHERE phone = $2', [newBalance, phone]);
     res.json({ newBalance });
   } catch (err) {
@@ -91,41 +83,46 @@ app.post('/deposit', async (req, res) => {
   }
 });
 
-// --- NEW: WITHDRAW ---
+// --- WITHDRAW (The Fixed Version) ---
 app.post('/withdraw', async (req, res) => {
   console.log("Withdraw Request:", req.body);
   const { phone, amount } = req.body;
+  
+  // Safety Checks
+  if (!phone || !amount) return res.status(400).json({ success: false, message: "Missing data" });
+  
   const withdrawAmount = parseFloat(amount);
+  if (isNaN(withdrawAmount) || withdrawAmount <= 0) {
+    return res.status(400).json({ success: false, message: "Invalid amount" });
+  }
 
   try {
+    // Check User
     const user = await pool.query('SELECT * FROM users WHERE phone = $1', [phone]);
-    
-    if (user.rows.length === 0) {
-      return res.json({ success: false, message: "User not found" });
-    }
+    if (user.rows.length === 0) return res.status(404).json({ success: false, message: "User not found" });
 
     const currentBalance = parseFloat(user.rows[0].balance);
 
+    // Check Balance
     if (currentBalance < withdrawAmount) {
-      return res.json({ success: false, message: "Insufficient Funds" });
+      return res.status(400).json({ success: false, message: "Insufficient Funds" });
     }
 
+    // Subtract Money
     const newBalance = currentBalance - withdrawAmount;
     await pool.query('UPDATE users SET balance = $1 WHERE phone = $2', [newBalance, phone]);
     
+    console.log("Withdraw Success. New Balance:", newBalance);
     res.json({ success: true, newBalance, message: "Cash out successful!" });
 
   } catch (err) {
-    console.error(err);
+    console.error("WITHDRAW ERROR:", err);
     res.status(500).json({ success: false, message: "Server Error" });
   }
 });
 
-// 4. WEBSOCKET GAME LOGIC
-const io = new Server(server, {
-  cors: { origin: "*" }
-});
-
+// 4. WEBSOCKETS (The Game)
+const io = new Server(server, { cors: { origin: "*" } });
 let waitingPlayer = null;
 
 io.on('connection', (socket) => {
@@ -133,15 +130,9 @@ io.on('connection', (socket) => {
 
   socket.on('FIND_MATCH', (data) => {
     if (waitingPlayer) {
-      // Start Game
       const matchId = 'match_' + Date.now();
-      const p1 = waitingPlayer;
-      const p2 = socket;
-
-      p1.join(matchId);
-      p2.join(matchId);
-
-      io.to(matchId).emit('GAME_START', { matchId, p1: p1.id, p2: p2.id });
+      io.to(waitingPlayer.id).emit('GAME_START', { matchId });
+      io.to(socket.id).emit('GAME_START', { matchId });
       waitingPlayer = null;
     } else {
       waitingPlayer = socket;
@@ -151,14 +142,7 @@ io.on('connection', (socket) => {
 
   socket.on('ROLL_DICE', ({ matchId }) => {
     const roll = Math.floor(Math.random() * 6) + 1;
-    io.to(matchId).emit('ROLL_RESULT', { playerId: socket.id, roll });
-    
-    // Simple win logic (In real game, we wait for both)
-    // For now, let's just broadcast the roll.
-  });
-
-  socket.on('disconnect', () => {
-    if (waitingPlayer === socket) waitingPlayer = null;
+    io.emit('ROLL_RESULT', { playerId: socket.id, roll }); // Broadcast to everyone for now
   });
 });
 
